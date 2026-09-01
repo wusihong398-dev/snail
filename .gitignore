@@ -1,0 +1,64 @@
+# Dependencies and generated files
+/backend/venv/
+/frontend/node_modules/
+/frontend/.next/
+__pycache__/
+*pycache*/
+*.py[cod]
+*.tsbuildinfo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Production data and backups (never publish)
+logs/
+uploads/
+backups/
+*.log
+*.dump
+*.sql.gz
+*.tar.gz
+*.zip
+*.bak
+*.backup*
+*.save*
+*.before_*
+*.bad-*
+*.old.*
+
+# Secrets and machine-local configuration
+.env
+.env.*
+!/backend/.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+id_rsa*
+id_ed25519*
+.ssh/
+.aws/
+.git-credentials
+.npmrc
+.netrc
+credentials*.json
+secrets*.json
+*xray*.json
+*proxy*config*.json
+*proxy*nodes*.json
+*hysteria*.yaml
+*hysteria*.yml
+*sing-box*.json
+*.sqlite*
+*.db
+
+# Runtime credential files are excluded; sanitized source modules are tracked.
+
+# Local editor/runtime artifacts
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+coverage/
