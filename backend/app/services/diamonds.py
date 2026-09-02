@@ -1,4 +1,5 @@
 from fastapi import HTTPException
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.user import User
 from app.models.diamond import DiamondTransaction
@@ -8,12 +9,20 @@ def total_diamonds(user: User) -> int:
     return int(user.paid_diamonds or 0) + int(user.bonus_diamonds or 0)
 
 
+async def _lock_balance(db, user):
+    return (await db.execute(select(User).where(User.id == user.id).with_for_update()
+                            .execution_options(populate_existing=True))).scalar_one()
+
+
 async def add_paid_diamonds(db: AsyncSession, user: User, amount: int, *, transaction_type: str = "purchase", reference_type: str | None = None, reference_id: int | None = None, description: str | None = None):
+    user = await _lock_balance(db, user)
     amount = int(amount)
     if amount <= 0:
         raise HTTPException(status_code=400, detail="钻石数量必须大于0")
     paid_before = int(user.paid_diamonds or 0)
     bonus_before = int(user.bonus_diamonds or 0)
+    if paid_before + amount > 2147483647:
+        raise HTTPException(400, "付费钻石余额超过允许上限")
     user.paid_diamonds = paid_before + amount
     tx = DiamondTransaction(
         user_id=user.id, transaction_type=transaction_type, diamond_type="paid", amount=amount,
@@ -27,11 +36,14 @@ async def add_paid_diamonds(db: AsyncSession, user: User, amount: int, *, transa
 
 
 async def add_bonus_diamonds(db: AsyncSession, user: User, amount: int, *, transaction_type: str = "admin_grant", reference_type: str | None = None, reference_id: int | None = None, description: str | None = None):
+    user = await _lock_balance(db, user)
     amount = int(amount)
     if amount <= 0:
         raise HTTPException(status_code=400, detail="钻石数量必须大于0")
     paid_before = int(user.paid_diamonds or 0)
     bonus_before = int(user.bonus_diamonds or 0)
+    if bonus_before + amount > 2147483647:
+        raise HTTPException(400, "奖励钻石余额超过允许上限")
     user.bonus_diamonds = bonus_before + amount
     tx = DiamondTransaction(
         user_id=user.id, transaction_type=transaction_type, diamond_type="bonus", amount=amount,
@@ -45,6 +57,7 @@ async def add_bonus_diamonds(db: AsyncSession, user: User, amount: int, *, trans
 
 
 async def spend_diamonds(db: AsyncSession, user: User, amount: int, *, transaction_type: str = "consume", reference_type: str | None = None, reference_id: int | None = None, description: str | None = None):
+    user = await _lock_balance(db, user)
     amount = int(amount)
     if amount <= 0:
         raise HTTPException(status_code=400, detail="消费钻石数量必须大于0")

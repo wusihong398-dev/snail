@@ -1,0 +1,86 @@
+name: Package Stage B Preview
+
+on:
+  push:
+    tags:
+      - "v0.3.1-stage-b-preview-*"
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build source packages
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VERSION="${GITHUB_REF_NAME}"
+
+          mkdir -p dist/package
+
+          git archive --format=tar HEAD | tar -xf - -C dist/package
+
+          rm -rf \
+            dist/package/.git \
+            dist/package/backend/venv \
+            dist/package/frontend/node_modules \
+            dist/package/frontend/.next \
+            dist/package/logs \
+            dist/package/uploads \
+            dist/package/backups
+
+          cat > dist/package/BUILD_INFO.txt <<EOF
+          Project: 蜗牛群聊精灵
+          Version: ${VERSION}
+          Commit: ${GITHUB_SHA}
+          Branch source: commercial-asset-safety-v0.3.1
+          Package type: Stage B Preview
+          Production deployment: NO
+          Production migration 021 executed: NO
+          EOF
+
+          (
+            cd dist/package
+            zip -qr "../snail-chat-elf-${VERSION}.zip" .
+            tar -czf "../snail-chat-elf-${VERSION}.tar.gz" .
+          )
+
+          cd dist
+
+          sha256sum \
+            "snail-chat-elf-${VERSION}.zip" \
+            "snail-chat-elf-${VERSION}.tar.gz" \
+            > SHA256SUMS.txt
+
+          ls -lh
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: snail-chat-elf-${{ github.ref_name }}
+          path: |
+            dist/snail-chat-elf-${{ github.ref_name }}.zip
+            dist/snail-chat-elf-${{ github.ref_name }}.tar.gz
+            dist/SHA256SUMS.txt
+          retention-days: 30
+
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          gh release create "${GITHUB_REF_NAME}" \
+            "dist/snail-chat-elf-${GITHUB_REF_NAME}.zip" \
+            "dist/snail-chat-elf-${GITHUB_REF_NAME}.tar.gz" \
+            "dist/SHA256SUMS.txt" \
+            --title "蜗牛群聊精灵 ${GITHUB_REF_NAME}" \
+            --notes "Stage B 当前完成代码预览包。此版本尚未部署生产，021 尚未执行生产迁移。"

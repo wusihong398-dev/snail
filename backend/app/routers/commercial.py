@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import json
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,15 +13,24 @@ from app.models.commercial import (
     MembershipPlan, MembershipProduct, UserMembership,
 )
 from app.models.diamond import DiamondTransaction
+from app.models.order import CoinTransaction
+from app.models.commercial_operations import CommercialOperationLog
 from app.schemas.commercial import (
     AgentCreate, AgentResponse, CustomerResponse,
     RedeemCodeCreate, RedeemCodeGenerated, RedeemCodeListItem,
     RedeemRequest, RedeemResult, AssetGrantRequest, DiamondBalanceResponse,
     MembershipPlanCreate, MembershipPlanResponse, MembershipProductCreate,
     MembershipProductResponse, MembershipDiamondPurchase, EntitlementPurchaseRequest,
+    CodeStatusRequest, CodeRefundRequest,
 )
 from app.services.redeem_codes import generate_code, hash_code
-from app.services.diamonds import add_paid_diamonds, add_bonus_diamonds, spend_diamonds, total_diamonds
+from app.services.diamonds import spend_diamonds, total_diamonds
+from app.services.commercial_operations import (
+    lock_agent, lock_user, lock_identity, adjust_agent_license_balance,
+    adjust_agent_diamond_quota, reserve_diamond_quota_for_code, required_diamond_quota,
+    grant_paid_diamonds, grant_bonus_diamonds, reservation_summary, balance_after,
+    release_unused_diamond_quota,
+)
 from app.auth.dependencies import require_admin
 from app.services.entitlements import get_entitlement_quantity, add_entitlement
 from app.services.system_settings import get_setting_int
@@ -38,16 +48,20 @@ async def list_agents(db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/agents", response_model=AgentResponse)
-async def create_agent(data: AgentCreate, db: AsyncSession = Depends(get_db)):
+async def create_agent(data: AgentCreate, db: AsyncSession = Depends(get_db), operator_name: str = Depends(require_admin)):
     exists = await db.execute(select(Agent).where(Agent.agent_code == data.agent_code.strip()))
     if exists.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="代理商编码已存在")
     agent = Agent(
         name=data.name.strip(), agent_code=data.agent_code.strip(), agent_type=data.agent_type,
-        commission_rate=data.commission_rate, license_balance=data.license_balance,
-        diamond_quota=data.diamond_quota,
+        commission_rate=data.commission_rate, license_balance=0, diamond_quota=0,
     )
     db.add(agent)
+    await db.flush()
+    await adjust_agent_license_balance(db, agent.id, data.license_balance, transaction_type="initial",
+        operator_name=operator_name, reason="新建代理初始授权库存", idempotency_key="initial")
+    await adjust_agent_diamond_quota(db, agent.id, data.diamond_quota, transaction_type="initial",
+        operator_name=operator_name, reason="新建代理初始钻石额度", idempotency_key="initial")
     await db.commit(); await db.refresh(agent)
     return agent
 
@@ -65,35 +79,55 @@ async def list_codes(db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/codes", response_model=RedeemCodeGenerated)
-async def create_code(data: RedeemCodeCreate, db: AsyncSession = Depends(get_db)):
+async def create_code(data: RedeemCodeCreate, db: AsyncSession = Depends(get_db), operator_name: str = Depends(require_admin)):
     if data.code_type not in SUPPORTED_CODE_TYPES:
         raise HTTPException(status_code=400, detail="不支持的授权码类型")
+    if data.request_id:
+        # Request guard precedes resource locks; never entered from a later lock level.
+        await lock_identity(db, "create-request", f"{operator_name}:{data.request_id}")
+        previous = (await db.execute(select(RedeemCode.id).where(
+            RedeemCode.created_by == operator_name, RedeemCode.request_id == data.request_id))).scalar_one_or_none()
+        if previous is not None:
+            raise HTTPException(409, "该请求已生成授权码；完整明文不会再次展示")
     agent = None
     if data.agent_id is not None:
-        agent = await db.get(Agent, data.agent_id)
+        agent = await lock_agent(db, data.agent_id)
         if agent is None or not agent.enabled:
             raise HTTPException(status_code=404, detail="代理商不存在或已停用")
-        if data.code_type == "group_license" and agent.agent_type in {"prepaid", "hybrid"}:
-            if agent.license_balance <= 0:
-                raise HTTPException(status_code=400, detail="代理商授权库存不足")
-            agent.license_balance -= 1
-        if data.code_type == "diamonds" and agent.agent_type in {"prepaid", "hybrid"}:
-            if data.value <= 0:
-                raise HTTPException(status_code=400, detail="钻石兑换码数量必须大于0")
-            if agent.diamond_quota < data.value:
-                raise HTTPException(status_code=400, detail="代理商钻石销售额度不足")
-            agent.diamond_quota -= data.value
     if data.code_type == "diamonds" and data.value <= 0:
         raise HTTPException(status_code=400, detail="钻石兑换码数量必须大于0")
+    if data.code_type == "diamonds":
+        required_diamond_quota(data.value, data.max_uses)
+    if data.customer_id is not None:
+        customer = await db.get(Customer, data.customer_id)
+        if customer is None or customer.agent_id != data.agent_id:
+            raise HTTPException(400, "客户不存在或不属于所选代理商")
     code, prefix, digest = generate_code(data.code_type)
     now = datetime.now(timezone.utc)
     item = RedeemCode(
         code_prefix=prefix, code_hash=digest, code_type=data.code_type,
         agent_id=data.agent_id, customer_id=data.customer_id, value=data.value,
         valid_from=now, expires_at=now + timedelta(hours=data.expires_hours),
-        max_uses=data.max_uses, used_count=0, status="active", created_by=data.created_by,
+        max_uses=data.max_uses, used_count=0, status="active", created_by=operator_name,
+        request_id=data.request_id,
     )
-    db.add(item); await db.commit(); await db.refresh(item)
+    db.add(item); await db.flush()
+    if agent is not None and data.code_type == "diamonds":
+        # All agent modes reserve the complete amount, not just prepaid/hybrid.
+        await reserve_diamond_quota_for_code(db, item, operator_name)
+    elif agent is not None and data.code_type == "group_license" and agent.agent_type in {"prepaid", "hybrid"}:
+        await adjust_agent_license_balance(db, agent.id, -1, transaction_type="code_reserve",
+            operator_name=operator_name, reason="生成客户群授权码", redeem_code_id=item.id,
+            idempotency_key=f"code:{item.id}:reserve")
+    if data.code_type == "diamonds" and agent is None:
+        # Preserve existing platform issuance, but do not claim a quota reservation.
+        item.reservation_source = "platform_manual"
+    db.add(CommercialOperationLog(operation_type="code_create", operator_name=operator_name,
+        target_type="redeem_code", target_id=item.id,
+        details_json=json.dumps({"code_type": item.code_type, "value": item.value,
+            "max_uses": item.max_uses, "agent_id": item.agent_id,
+            "reservation_source": item.reservation_source, "reserved_total": item.reserved_total})))
+    await db.commit(); await db.refresh(item)
     return RedeemCodeGenerated(
         id=item.id, code=code, code_type=item.code_type, agent_id=item.agent_id,
         customer_id=item.customer_id, value=item.value, expires_at=item.expires_at,
@@ -102,7 +136,9 @@ async def create_code(data: RedeemCodeCreate, db: AsyncSession = Depends(get_db)
 
 
 async def _get_or_create_user(db: AsyncSession, wx_user_id: str, nickname: str | None):
-    result = await db.execute(select(User).where(User.wx_user_id == wx_user_id))
+    await lock_identity(db, "user", wx_user_id)
+    result = await db.execute(select(User).where(User.wx_user_id == wx_user_id).with_for_update()
+                              .execution_options(populate_existing=True))
     user = result.scalar_one_or_none()
     if user is None:
         user = User(wx_user_id=wx_user_id, nickname=nickname or "", coins=0, experience=0)
@@ -113,7 +149,9 @@ async def _get_or_create_user(db: AsyncSession, wx_user_id: str, nickname: str |
 
 
 async def _get_or_create_group(db: AsyncSession, wx_group_id: str, group_name: str | None):
-    result = await db.execute(select(Group).where(Group.wx_group_id == wx_group_id))
+    await lock_identity(db, "group", wx_group_id)
+    result = await db.execute(select(Group).where(Group.wx_group_id == wx_group_id).with_for_update()
+                              .execution_options(populate_existing=True))
     group = result.scalar_one_or_none()
     if group is None:
         group = Group(wx_group_id=wx_group_id, group_name=group_name or wx_group_id)
@@ -126,20 +164,39 @@ async def _get_or_create_group(db: AsyncSession, wx_group_id: str, group_name: s
 @public_router.post("/codes/redeem", response_model=RedeemResult)
 async def redeem_code(data: RedeemRequest, db: AsyncSession = Depends(get_db)):
     digest = hash_code(data.code)
-    result = await db.execute(select(RedeemCode).where(RedeemCode.code_hash == digest).with_for_update())
+    # Read immutable ownership first, then acquire locks in the universal order.
+    snapshot = (await db.execute(select(RedeemCode.id, RedeemCode.agent_id)
+                                .where(RedeemCode.code_hash == digest))).first()
+    if snapshot is None:
+        raise HTTPException(404, "授权码不存在")
+    if snapshot.agent_id is not None:
+        await lock_agent(db, snapshot.agent_id)
+    result = await db.execute(select(RedeemCode).where(RedeemCode.code_hash == digest).with_for_update()
+                              .execution_options(populate_existing=True))
     item = result.scalar_one_or_none()
     if item is None:
         raise HTTPException(status_code=404, detail="授权码不存在")
+    if item.agent_id != snapshot.agent_id:
+        raise HTTPException(409, "授权码归属发生变化，请重试")
+    if data.request_id:
+        previous = (await db.execute(select(RedeemCodeUsage).where(
+            RedeemCodeUsage.code_id == item.id, RedeemCodeUsage.request_id == data.request_id))).scalar_one_or_none()
+        if previous:
+            if previous.wx_user_id != data.wx_user_id or previous.wx_group_id != data.wx_group_id:
+                raise HTTPException(409, "幂等请求身份不匹配")
+            if previous.success and previous.result_json:
+                return RedeemResult(**json.loads(previous.result_json))
+            raise HTTPException(409, "该请求已处理")
+    if item.max_uses > 1 and not data.request_id:
+        raise HTTPException(400, "多次授权码兑换必须提供稳定的 request_id")
     now = datetime.now(timezone.utc)
     if item.status != "active":
         raise HTTPException(status_code=400, detail="授权码不可用")
     if item.valid_from and item.valid_from > now:
         raise HTTPException(status_code=400, detail="授权码尚未生效")
     if item.expires_at and item.expires_at < now:
-        item.status = "expired"; await db.commit()
         raise HTTPException(status_code=400, detail="授权码已过期")
     if item.used_count >= item.max_uses:
-        item.status = "redeemed"; await db.commit()
         raise HTTPException(status_code=400, detail="授权码已使用")
 
     user = await _get_or_create_user(db, data.wx_user_id, data.nickname)
@@ -148,7 +205,7 @@ async def redeem_code(data: RedeemRequest, db: AsyncSession = Depends(get_db)):
     message = "兑换成功"
 
     if item.code_type == "diamonds":
-        await add_paid_diamonds(
+        await grant_paid_diamonds(
             db, user, item.value, transaction_type="agent_code_purchase",
             reference_type="redeem_code", reference_id=item.id,
             description=f"代理商兑换码充值 {item.value} 钻石",
@@ -158,8 +215,6 @@ async def redeem_code(data: RedeemRequest, db: AsyncSession = Depends(get_db)):
     elif item.code_type == "group_license":
         if not data.wx_group_id:
             raise HTTPException(status_code=400, detail="群管理授权码必须在微信群中使用")
-        group = await _get_or_create_group(db, data.wx_group_id, data.group_name)
-        group_id = group.id
         if customer_id is None:
             customer = Customer(
                 agent_id=item.agent_id, owner_user_id=user.id,
@@ -169,11 +224,18 @@ async def redeem_code(data: RedeemRequest, db: AsyncSession = Depends(get_db)):
             )
             db.add(customer); await db.flush(); customer_id = customer.id; item.customer_id = customer_id
         else:
-            customer = await db.get(Customer, customer_id)
+            customer = (await db.execute(select(Customer).where(Customer.id == customer_id)
+                                        .with_for_update())).scalar_one_or_none()
             if customer is None:
                 raise HTTPException(status_code=400, detail="授权码关联客户不存在")
             if customer.owner_user_id != user.id:
                 raise HTTPException(status_code=403, detail="该管理授权码已预绑定其他购买者微信号")
+            if customer.agent_id != item.agent_id:
+                raise HTTPException(403, "授权码与客户代理归属不一致")
+        if not customer.enabled or customer.license_status != "active" or (customer.license_expire_at and customer.license_expire_at <= now):
+            raise HTTPException(403, "客户授权已暂停或过期")
+        group = await _get_or_create_group(db, data.wx_group_id, data.group_name)
+        group_id = group.id
         if group.customer_id not in (None, customer_id):
             raise HTTPException(status_code=409, detail="该群已绑定其他购买客户")
 
@@ -181,6 +243,8 @@ async def redeem_code(data: RedeemRequest, db: AsyncSession = Depends(get_db)):
             select(CustomerGroupOwnership).where(CustomerGroupOwnership.group_id == group.id)
         )
         existing_ownership = existing_ownership_result.scalar_one_or_none()
+        if existing_ownership is not None and existing_ownership.customer_id != customer_id:
+            raise HTTPException(409, "该群归属其他客户")
         if existing_ownership is None:
             customer_groups_result = await db.execute(
                 select(CustomerGroupOwnership).where(CustomerGroupOwnership.customer_id == customer_id)
@@ -219,14 +283,80 @@ async def redeem_code(data: RedeemRequest, db: AsyncSession = Depends(get_db)):
     item.used_count += 1
     if item.used_count >= item.max_uses:
         item.status = "redeemed"
+    response = RedeemResult(success=True, code_type=item.code_type, message=message,
+        user_id=user.id, customer_id=customer_id, group_id=group_id, value=item.value)
     db.add(RedeemCodeUsage(
         code_id=item.id, agent_id=item.agent_id, customer_id=customer_id,
         user_id=user.id, wx_user_id=data.wx_user_id, group_id=group_id,
         wx_group_id=data.wx_group_id, usage_type=item.code_type, value=item.value,
-        success=True,
+        success=True, request_id=data.request_id, use_number=item.used_count,
+        result_json=response.model_dump_json(),
     ))
     await db.commit()
-    return RedeemResult(success=True, code_type=item.code_type, message=message, user_id=user.id, customer_id=customer_id, group_id=group_id, value=item.value)
+    return response
+
+
+@router.get("/codes/{code_id}/reservation")
+async def code_reservation(code_id: int, db: AsyncSession = Depends(get_db)):
+    item = await db.get(RedeemCode, code_id)
+    if item is None:
+        raise HTTPException(404, "授权码不存在")
+    if item.code_type != "diamonds":
+        raise HTTPException(400, "仅钻石码支持额度汇总")
+    return reservation_summary(item)
+
+
+async def _change_code_status(code_id, status, data, db, operator_name):
+    item = (await db.execute(select(RedeemCode).where(RedeemCode.id == code_id)
+                            .with_for_update())).scalar_one_or_none()
+    if item is None:
+        raise HTTPException(404, "授权码不存在")
+    if item.status == status:
+        return {"success": True, "code_id": item.id, "status": item.status}
+    if item.status not in {"active", "frozen"}:
+        raise HTTPException(409, "当前授权码状态不允许该操作")
+    before = item.status
+    item.status = status
+    db.add(CommercialOperationLog(operation_type=f"code_{status}", operator_name=operator_name,
+        target_type="redeem_code", target_id=item.id,
+        details_json=json.dumps({"before": before, "after": status, "reason": data.reason})))
+    await db.commit()
+    return {"success": True, "code_id": item.id, "status": item.status}
+
+
+@router.post("/codes/{code_id}/freeze")
+async def freeze_code(code_id: int, data: CodeStatusRequest, db: AsyncSession = Depends(get_db),
+                      operator_name: str = Depends(require_admin)):
+    return await _change_code_status(code_id, "frozen", data, db, operator_name)
+
+
+@router.post("/codes/{code_id}/void")
+async def void_code(code_id: int, data: CodeStatusRequest, db: AsyncSession = Depends(get_db),
+                    operator_name: str = Depends(require_admin)):
+    return await _change_code_status(code_id, "void", data, db, operator_name)
+
+
+@router.post("/codes/{code_id}/refund")
+async def refund_code_reservation(code_id: int, data: CodeRefundRequest,
+                                  db: AsyncSession = Depends(get_db),
+                                  operator_name: str = Depends(require_admin)):
+    snapshot = (await db.execute(select(RedeemCode.id, RedeemCode.agent_id)
+                                 .where(RedeemCode.id == code_id))).first()
+    if snapshot is None:
+        raise HTTPException(404, "授权码不存在")
+    if snapshot.agent_id is None:
+        raise HTTPException(400, "平台手工发行码没有可返还的代理额度")
+    await lock_agent(db, snapshot.agent_id)
+    item = (await db.execute(select(RedeemCode).where(RedeemCode.id == code_id)
+                            .with_for_update().execution_options(populate_existing=True))).scalar_one()
+    tx = await release_unused_diamond_quota(db, item, operator_name, data.reason, data.idempotency_key)
+    db.add(CommercialOperationLog(operation_type="code_refund", operator_name=operator_name,
+        target_type="redeem_code", target_id=item.id,
+        details_json=json.dumps({"amount": int(tx.amount), "quota_before": int(tx.quota_before),
+            "quota_after": int(tx.quota_after), "idempotency_key": data.idempotency_key})))
+    await db.commit()
+    return {"success": True, "code_id": item.id, "released": int(tx.amount),
+            "quota_before": int(tx.quota_before), "quota_after": int(tx.quota_after)}
 
 
 @router.get("/code-usages")
@@ -263,20 +393,39 @@ async def list_diamond_transactions(db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/asset-grants")
-async def grant_asset(data: AssetGrantRequest, db: AsyncSession = Depends(get_db)):
+async def grant_asset(data: AssetGrantRequest, db: AsyncSession = Depends(get_db), operator_name: str = Depends(require_admin)):
     operator = await db.get(User, data.operator_user_id)
-    target = await db.get(User, data.target_user_id)
+    target = await lock_user(db, data.target_user_id)
     if operator is None or target is None:
         raise HTTPException(status_code=404, detail="操作用户或目标用户不存在")
+    customer = (await db.execute(select(Customer).where(Customer.id == data.customer_id)
+                                .with_for_update())).scalar_one_or_none()
+    now = datetime.now(timezone.utc)
+    if customer is None or not customer.enabled or customer.license_status != "active" or (
+            customer.license_expire_at and customer.license_expire_at <= now):
+        raise HTTPException(403, "客户授权无效")
     if data.group_id is not None:
-        member_result = await db.execute(select(GroupMember).where(GroupMember.group_id == data.group_id, GroupMember.user_id == data.operator_user_id, GroupMember.member_role.in_(["owner", "admin"]), GroupMember.is_active == True))
+        group = (await db.execute(select(Group).where(Group.id == data.group_id).with_for_update())).scalar_one_or_none()
+        if group is None or group.customer_id != data.customer_id:
+            raise HTTPException(403, "群不属于当前客户")
+        member_result = await db.execute(select(GroupMember).where(GroupMember.customer_id == data.customer_id, GroupMember.group_id == data.group_id, GroupMember.user_id == data.operator_user_id, GroupMember.member_role.in_(["owner", "admin"]), GroupMember.is_active == True))
         if member_result.scalar_one_or_none() is None:
             raise HTTPException(status_code=403, detail="当前微信号没有该群管理权限")
+        target_member = (await db.execute(select(GroupMember).where(GroupMember.customer_id == data.customer_id,
+            GroupMember.group_id == data.group_id, GroupMember.user_id == data.target_user_id,
+            GroupMember.is_active == True))).scalar_one_or_none()
+        if target_member is None:
+            raise HTTPException(403, "目标用户不是该群有效成员")
+    elif customer.owner_user_id != data.operator_user_id:
+        raise HTTPException(403, "未指定群时只允许客户 Owner 操作")
     if data.asset_type == "coins":
-        before = int(target.coins or 0); target.coins = before + data.amount; after = target.coins
+        before = int(target.coins or 0); target.coins = balance_after(before, data.amount); after = target.coins
+        db.add(CoinTransaction(user_id=target.id, transaction_type="group_admin_grant",
+            amount=data.amount, balance_before=before, balance_after=after,
+            description=data.reason or "群管理员赠送蜗币"))
     elif data.asset_type == "bonus_diamonds":
         before = int(target.bonus_diamonds or 0)
-        await add_bonus_diamonds(db, target, data.amount, transaction_type="group_admin_grant", reference_type="customer", reference_id=data.customer_id, description=data.reason or "群管理员赠送奖励钻石")
+        await grant_bonus_diamonds(db, target, data.amount, transaction_type="group_admin_grant", reference_type="customer", reference_id=data.customer_id, description=data.reason or "群管理员赠送奖励钻石")
         after = int(target.bonus_diamonds or 0)
     else:
         raise HTTPException(status_code=400, detail="只允许赠送蜗币或奖励钻石")
@@ -285,7 +434,13 @@ async def grant_asset(data: AssetGrantRequest, db: AsyncSession = Depends(get_db
         target_user_id=data.target_user_id, asset_type=data.asset_type, amount=data.amount,
         balance_before=before, balance_after=after, reason=data.reason,
     )
-    db.add(grant); await db.commit(); await db.refresh(grant)
+    db.add(grant); await db.flush()
+    db.add(CommercialOperationLog(operation_type="asset_grant", operator_name=operator_name,
+        target_type="admin_asset_grant", target_id=grant.id,
+        details_json=json.dumps({"customer_id": data.customer_id, "group_id": data.group_id,
+            "operator_user_id": data.operator_user_id, "target_user_id": data.target_user_id,
+            "asset_type": data.asset_type, "amount": data.amount, "before": before, "after": after})))
+    await db.commit(); await db.refresh(grant)
     return {"success": True, "grant_id": grant.id, "balance_before": before, "balance_after": after}
 
 
@@ -345,7 +500,7 @@ async def purchase_membership_with_diamonds(data: MembershipDiamondPurchase, db:
     membership = UserMembership(user_id=user.id, plan_id=plan.id, product_id=product.id, status="active", started_at=now, expires_at=expires, next_bonus_at=(now + timedelta(days=30) if product.bonus_grant_mode == "monthly" and product.bonus_diamonds > 0 else None), source_type="diamond_purchase")
     db.add(membership); await db.flush()
     if product.bonus_diamonds > 0 and product.bonus_grant_mode == "immediate":
-        await add_bonus_diamonds(db, user, product.bonus_diamonds, transaction_type="membership_grant", reference_type="user_membership", reference_id=membership.id, description=f"{product.name}会员赠钻")
+        await grant_bonus_diamonds(db, user, product.bonus_diamonds, transaction_type="membership_grant", reference_type="user_membership", reference_id=membership.id, description=f"{product.name}会员赠钻")
     await db.commit()
     return {"success": True, "membership_id": membership.id, "member_level": user.member_level, "expires_at": user.member_expire_at, "paid_diamonds": user.paid_diamonds, "bonus_diamonds": user.bonus_diamonds}
 

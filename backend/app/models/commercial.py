@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, Numeric, Text
+from sqlalchemy import Column, Integer, BigInteger, String, Boolean, DateTime, Numeric, Text
 from sqlalchemy.sql import func
 from app.database import Base
 
@@ -84,6 +84,9 @@ class RedeemCode(Base):
     used_count = Column(Integer, default=0, nullable=False)
     status = Column(String(30), default="active", nullable=False)
     created_by = Column(String(80), nullable=True)
+    request_id = Column(String(128), nullable=True)
+    reservation_source = Column(String(30), nullable=True)
+    reserved_total = Column(BigInteger, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
@@ -101,6 +104,9 @@ class RedeemCodeUsage(Base):
     value = Column(Integer, default=0, nullable=False)
     success = Column(Boolean, default=False, nullable=False)
     failure_reason = Column(String(255), nullable=True)
+    request_id = Column(String(128), nullable=True)
+    use_number = Column(Integer, nullable=True)
+    result_json = Column(Text, nullable=True)
     used_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
