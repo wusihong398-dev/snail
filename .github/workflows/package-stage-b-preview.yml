@@ -13,8 +13,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+
       - name: Checkout
         uses: actions/checkout@v4
+
 
       - name: Build source packages
         shell: bash
@@ -29,7 +31,6 @@ jobs:
 
           git archive --format=tar HEAD | tar -xf - -C dist/package
 
-          echo "Cleaning development files..."
 
           rm -rf \
             dist/package/.git \
@@ -41,64 +42,29 @@ jobs:
             dist/package/backups \
             dist/package/.github
 
-          cat > dist/package/BUILD_INFO.txt <<EOF
-Project: 蜗牛群聊精灵
 
-Version:
-${VERSION}
-
-Commit:
-${GITHUB_SHA}
-
-Branch:
-commercial-operations-v0.3.2
-
-Package:
-Stage C Commercial Operations Preview
-
-Features:
-- Commercial backend management
-- Agent management
-- Customer management
-- License code operations
-- Diamond quota ledger
-- Refund/idempotency protection
-- Commercial operation audit
-
-Validation:
-- Backend tests passed
-- Frontend build passed
-
-Production:
-Deployment: NO
-
-Database migration:
-020/021/022 production migration executed: NO
-EOF
+          {
+            echo "Project: 蜗牛群聊精灵"
+            echo "Version: ${VERSION}"
+            echo "Commit: ${GITHUB_SHA}"
+            echo "Branch: commercial-operations-v0.3.2"
+            echo "Package: Stage C Commercial Operations Preview"
+            echo "Production deployment: NO"
+            echo "Production migration 020/021/022: NO"
+          } > dist/package/BUILD_INFO.txt
 
 
-          echo "Creating ZIP..."
+          cd dist/package
 
-          (
-            cd dist/package
-            zip -qr \
-              "../snail-chat-elf-${VERSION}.zip" .
-          )
+          zip -qr \
+            "../snail-chat-elf-${VERSION}.zip" .
 
 
-          echo "Creating TAR.GZ..."
-
-          (
-            cd dist/package
-            tar -czf \
-              "../snail-chat-elf-${VERSION}.tar.gz" .
-          )
+          tar -czf \
+            "../snail-chat-elf-${VERSION}.tar.gz" .
 
 
-          cd dist
-
-
-          echo "Generating SHA256..."
+          cd ..
 
           sha256sum \
             "snail-chat-elf-${VERSION}.zip" \
@@ -106,28 +72,25 @@ EOF
             > SHA256SUMS.txt
 
 
-          echo "Package result:"
-          ls -lh
-
-
-      - name: Upload workflow artifacts
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
+
         with:
           name: snail-chat-elf-${{ github.ref_name }}
+
           path: |
             dist/snail-chat-elf-${{ github.ref_name }}.zip
             dist/snail-chat-elf-${{ github.ref_name }}.tar.gz
             dist/SHA256SUMS.txt
-          retention-days: 30
 
 
       - name: Create GitHub Release
-        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
 
+        shell: bash
+
         run: |
-          set -euo pipefail
 
           gh release create \
             "${GITHUB_REF_NAME}" \
@@ -135,24 +98,4 @@ EOF
             "dist/snail-chat-elf-${GITHUB_REF_NAME}.tar.gz" \
             "dist/SHA256SUMS.txt" \
             --title "蜗牛群聊精灵 ${GITHUB_REF_NAME}" \
-            --notes "
-Stage C 商业运营后台预览版本。
-
-包含：
-- 商业运营后台
-- 代理商管理
-- 客户管理
-- 授权码管理
-- 钻石额度流水
-- 幂等保护
-- 商业审计日志
-
-验证：
-- Backend pytest passed
-- Concurrency tests passed
-- Frontend build passed
-
-注意：
-此版本未部署生产。
-020/021/022 未执行生产迁移。
-"
+            --notes "Stage C Commercial Operations Preview. Production deployment NO. Migration 020/021/022 NOT executed."
