@@ -21,6 +21,25 @@ class AgentResponse(AgentCreate):
         from_attributes = True
 
 
+class AgentUpdate(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    agent_type: Literal["commission", "prepaid", "hybrid"]
+    commission_rate: float = Field(ge=0, le=1)
+    reason: str = Field(min_length=1, max_length=255)
+    request_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$")
+
+
+class BalanceAdjustment(BaseModel):
+    change: int = Field(ge=-2147483647, le=2147483647)
+    reason: str = Field(min_length=1, max_length=255)
+    request_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$")
+
+
+class OperationRequest(BaseModel):
+    reason: str = Field(min_length=1, max_length=255)
+    request_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$")
+
+
 class CustomerResponse(BaseModel):
     id: int
     agent_id: int | None = None
@@ -35,6 +54,21 @@ class CustomerResponse(BaseModel):
     created_at: datetime | None = None
     class Config:
         from_attributes = True
+
+
+class CustomerUpdate(BaseModel):
+    name: str | None = Field(default=None, max_length=128)
+    agent_id: int | None = None
+    plan_code: str = Field(min_length=1, max_length=64)
+    max_groups: int = Field(ge=0, le=2147483647)
+    reason: str = Field(min_length=1, max_length=255)
+    request_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$")
+
+
+class CustomerRenewRequest(BaseModel):
+    duration_days: int = Field(ge=1, le=36500)
+    reason: str = Field(min_length=1, max_length=255)
+    request_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$")
 
 
 class RedeemCodeCreate(BaseModel):
@@ -90,6 +124,7 @@ class RedeemRequest(BaseModel):
 
 class CodeStatusRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=255)
+    request_id: str | None = Field(default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$")
 
 
 class CodeRefundRequest(BaseModel):
@@ -156,6 +191,11 @@ class MembershipProductResponse(MembershipProductCreate):
     created_at: datetime | None = None
     class Config:
         from_attributes = True
+
+
+class MembershipProductUpdate(MembershipProductCreate):
+    reason: str = Field(min_length=1, max_length=255)
+    request_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$")
 
 
 class MembershipDiamondPurchase(BaseModel):

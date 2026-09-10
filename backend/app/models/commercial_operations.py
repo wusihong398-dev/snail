@@ -44,5 +44,6 @@ class CommercialOperationLog(Base):
     operator_name = Column(String(128), nullable=False)
     target_type = Column(String(40), nullable=False)
     target_id = Column(Integer, nullable=False)
+    request_id = Column(String(128), nullable=True)
     details_json = Column(Text, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)

@@ -25,8 +25,8 @@ class AssetTestCase(unittest.IsolatedAsyncioTestCase):
         url = make_url(os.environ["TEST_DATABASE_URL"])
         assert url.database == "snail_stageb_test" and url.port != 5432
         self.admin = await asyncpg.connect(url.set(drivername="postgresql").render_as_string(hide_password=False))
+        self.database_role = await self.admin.fetchval("SELECT current_user")
         await self.admin.execute(f'CREATE SCHEMA "{self.schema}"')
-        await self.admin.execute(f'GRANT USAGE ON SCHEMA "{self.schema}" TO snail_admin')
         self.engine = create_async_engine(url, connect_args={"server_settings": {
             "search_path": self.schema, "lock_timeout": "5000", "statement_timeout": "10000"}})
         self.sessions = async_sessionmaker(self.engine, expire_on_commit=False)
@@ -36,9 +36,16 @@ class AssetTestCase(unittest.IsolatedAsyncioTestCase):
         await self.admin.execute(f'SET search_path TO "{self.schema}"')
         migrations = Path(__file__).resolve().parents[1] / "migrations"
         # Exact immutable production migration, followed by the proposed additive migration.
-        await self.admin.execute((migrations / "020_commercial_platform.sql").read_text())
+        # The disposable cluster deliberately has no production role. Preserve every DDL
+        # statement while mapping only the object owner/grantee to its isolated login.
+        stage_020 = (migrations / "020_commercial_platform.sql").read_text().replace(
+            "snail_admin", self.database_role)
+        await self.admin.execute(stage_020)
         await self.before_stage_b()
-        await self.admin.execute((migrations / "021_commercial_operations.sql").read_text())
+        stage_021 = (migrations / "021_commercial_operations.sql").read_text().replace(
+            "snail_admin", self.database_role)
+        await self.admin.execute(stage_021)
+        await self.admin.execute((migrations / "022_commercial_operations_admin.sql").read_text())
 
     async def before_stage_b(self):
         pass

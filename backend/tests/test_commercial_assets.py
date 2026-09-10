@@ -8,7 +8,11 @@ from app.models.commercial_operations import CommercialOperationLog
 from app.models.commercial_operations import AgentDiamondQuotaTransaction as QuotaTx, AgentLicenseTransaction as LicenseTx
 from app.models.diamond import DiamondTransaction
 from app.models.user import User
-from app.services.commercial_operations import grant_bonus_diamonds, reservation_summary
+from app.services.commercial_operations import (
+    adjust_agent_diamond_quota,
+    grant_bonus_diamonds,
+    reservation_summary,
+)
 from app.services.diamonds import spend_diamonds
 from tests.support import AssetTestCase
 

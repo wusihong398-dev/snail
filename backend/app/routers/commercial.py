@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 import json
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -14,14 +14,15 @@ from app.models.commercial import (
 )
 from app.models.diamond import DiamondTransaction
 from app.models.order import CoinTransaction
-from app.models.commercial_operations import CommercialOperationLog
+from app.models.commercial_operations import CommercialOperationLog, AgentLicenseTransaction, AgentDiamondQuotaTransaction
 from app.schemas.commercial import (
-    AgentCreate, AgentResponse, CustomerResponse,
+    AgentCreate, AgentResponse, AgentUpdate, BalanceAdjustment, OperationRequest,
+    CustomerResponse, CustomerUpdate, CustomerRenewRequest,
     RedeemCodeCreate, RedeemCodeGenerated, RedeemCodeListItem,
     RedeemRequest, RedeemResult, AssetGrantRequest, DiamondBalanceResponse,
     MembershipPlanCreate, MembershipPlanResponse, MembershipProductCreate,
     MembershipProductResponse, MembershipDiamondPurchase, EntitlementPurchaseRequest,
-    CodeStatusRequest, CodeRefundRequest,
+    CodeStatusRequest, CodeRefundRequest, MembershipProductUpdate,
 )
 from app.services.redeem_codes import generate_code, hash_code
 from app.services.diamonds import spend_diamonds, total_diamonds
@@ -39,6 +40,30 @@ router = APIRouter(prefix="/commercial", tags=["商业授权与代理"], depende
 public_router = APIRouter(prefix="/commercial", tags=["授权码兑换"])
 
 SUPPORTED_CODE_TYPES = {"group_license", "diamonds", "membership", "partner_slot", "baby_slot"}
+
+
+def _page(page: int, page_size: int):
+    if page < 1 or page_size < 1 or page_size > 200:
+        raise HTTPException(400, "分页参数无效（page>=1，page_size为1到200）")
+    return (page - 1) * page_size
+
+
+async def _operation_once(db, operation_type, target_type, target_id, request_id):
+    await lock_identity(db, "admin-operation", f"{operation_type}:{target_type}:{target_id}:{request_id}")
+    return (await db.execute(select(CommercialOperationLog).where(
+        CommercialOperationLog.operation_type == operation_type,
+        CommercialOperationLog.target_type == target_type,
+        CommercialOperationLog.target_id == target_id,
+        CommercialOperationLog.request_id == request_id,
+    ))).scalar_one_or_none()
+
+
+def _log(operation_type, operator_name, target_type, target_id, before, after, reason, request_id):
+    return CommercialOperationLog(operation_type=operation_type, operator_name=operator_name,
+        target_type=target_type, target_id=target_id, request_id=request_id,
+        details_json=json.dumps({"actor": operator_name, "action": operation_type,
+            "before": before, "after": after, "reason": reason,
+            "request_id": request_id}, ensure_ascii=False, default=str))
 
 
 @router.get("/agents", response_model=list[AgentResponse])
@@ -66,16 +91,181 @@ async def create_agent(data: AgentCreate, db: AsyncSession = Depends(get_db), op
     return agent
 
 
+@router.put("/agents/{agent_id}", response_model=AgentResponse)
+async def update_agent(agent_id: int, data: AgentUpdate, db: AsyncSession = Depends(get_db),
+                       operator_name: str = Depends(require_admin)):
+    old = await _operation_once(db, "agent_update", "agent", agent_id, data.request_id)
+    if old:
+        agent = await db.get(Agent, agent_id)
+        if agent is None: raise HTTPException(404, "代理商不存在")
+        return agent
+    agent = await lock_agent(db, agent_id)
+    before = {"name": agent.name, "agent_type": agent.agent_type, "commission_rate": float(agent.commission_rate)}
+    agent.name, agent.agent_type, agent.commission_rate = data.name.strip(), data.agent_type, data.commission_rate
+    after = {"name": agent.name, "agent_type": agent.agent_type, "commission_rate": float(agent.commission_rate)}
+    db.add(_log("agent_update", operator_name, "agent", agent.id, before, after, data.reason, data.request_id))
+    await db.commit(); await db.refresh(agent)
+    return agent
+
+
+async def _set_agent_enabled(agent_id, enabled, data, db, operator_name):
+    op = "agent_enable" if enabled else "agent_disable"
+    old = await _operation_once(db, op, "agent", agent_id, data.request_id)
+    if old:
+        return {"success": True, "agent_id": agent_id, "enabled": enabled, "idempotent": True}
+    agent = await lock_agent(db, agent_id); before = agent.enabled; agent.enabled = enabled
+    db.add(_log(op, operator_name, "agent", agent.id, before, enabled, data.reason, data.request_id))
+    await db.commit()
+    return {"success": True, "agent_id": agent.id, "enabled": enabled}
+
+
+@router.post("/agents/{agent_id}/enable")
+async def enable_agent(agent_id: int, data: OperationRequest, db: AsyncSession = Depends(get_db), operator_name: str = Depends(require_admin)):
+    return await _set_agent_enabled(agent_id, True, data, db, operator_name)
+
+
+@router.post("/agents/{agent_id}/disable")
+async def disable_agent(agent_id: int, data: OperationRequest, db: AsyncSession = Depends(get_db), operator_name: str = Depends(require_admin)):
+    return await _set_agent_enabled(agent_id, False, data, db, operator_name)
+
+
+async def _adjust_agent(agent_id, data, db, operator_name, quota):
+    fn = adjust_agent_diamond_quota if quota else adjust_agent_license_balance
+    tx = await fn(db, agent_id, data.change, transaction_type="admin_adjustment",
+        operator_name=operator_name, reason=data.reason, idempotency_key=data.request_id)
+    await db.commit()
+    before = int(tx.quota_before if quota else tx.balance_before)
+    after = int(tx.quota_after if quota else tx.balance_after)
+    return {"success": True, "agent_id": agent_id, "before": before, "change": int(tx.amount), "after": after,
+            "actor": tx.operator_name, "reason": data.reason, "request_id": data.request_id}
+
+
+@router.post("/agents/{agent_id}/license-balance")
+async def adjust_license(agent_id: int, data: BalanceAdjustment, db: AsyncSession = Depends(get_db), operator_name: str = Depends(require_admin)):
+    return await _adjust_agent(agent_id, data, db, operator_name, False)
+
+
+@router.post("/agents/{agent_id}/diamond-quota")
+async def adjust_quota(agent_id: int, data: BalanceAdjustment, db: AsyncSession = Depends(get_db), operator_name: str = Depends(require_admin)):
+    return await _adjust_agent(agent_id, data, db, operator_name, True)
+
+
 @router.get("/customers", response_model=list[CustomerResponse])
 async def list_customers(db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Customer).order_by(Customer.id.desc()))
     return result.scalars().all()
 
 
-@router.get("/codes", response_model=list[RedeemCodeListItem])
-async def list_codes(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(RedeemCode).order_by(RedeemCode.id.desc()).limit(1000))
-    return result.scalars().all()
+async def _customer_detail(db, customer_id):
+    row = (await db.execute(select(Customer, User.wx_user_id).join(User, User.id == Customer.owner_user_id)
+        .where(Customer.id == customer_id))).first()
+    if row is None:
+        raise HTTPException(404, "客户不存在")
+    customer, owner_wx = row
+    count = (await db.execute(select(func.count()).select_from(CustomerGroupOwnership)
+        .where(CustomerGroupOwnership.customer_id == customer_id))).scalar_one()
+    return {"id": customer.id, "agent_id": customer.agent_id, "owner_user_id": customer.owner_user_id,
+        "owner_wx_user_id": owner_wx, "name": customer.name, "plan_code": customer.plan_code,
+        "license_status": customer.license_status, "license_started_at": customer.license_started_at,
+        "license_expire_at": customer.license_expire_at, "max_groups": customer.max_groups,
+        "current_groups": count, "enabled": customer.enabled, "created_at": customer.created_at}
+
+
+@router.get("/customers/{customer_id}")
+async def get_customer(customer_id: int, db: AsyncSession = Depends(get_db)):
+    return await _customer_detail(db, customer_id)
+
+
+@router.get("/customers/{customer_id}/groups")
+async def customer_groups(customer_id: int, db: AsyncSession = Depends(get_db)):
+    await _customer_detail(db, customer_id)
+    rows = (await db.execute(select(CustomerGroupOwnership, Group).join(Group, Group.id == CustomerGroupOwnership.group_id)
+        .where(CustomerGroupOwnership.customer_id == customer_id).order_by(CustomerGroupOwnership.id.desc()))).all()
+    return [{"ownership_id": own.id, "group_id": group.id, "wx_group_id": group.wx_group_id,
+        "group_name": group.group_name, "owner_user_id": own.owner_user_id, "activated_at": own.activated_at}
+        for own, group in rows]
+
+
+@router.put("/customers/{customer_id}")
+async def update_customer(customer_id: int, data: CustomerUpdate, db: AsyncSession = Depends(get_db), operator_name: str = Depends(require_admin)):
+    old = await _operation_once(db, "customer_update", "customer", customer_id, data.request_id)
+    if old: return await _customer_detail(db, customer_id)
+    customer = (await db.execute(select(Customer).where(Customer.id == customer_id).with_for_update())).scalar_one_or_none()
+    if customer is None: raise HTTPException(404, "客户不存在")
+    if data.agent_id is not None and await db.get(Agent, data.agent_id) is None: raise HTTPException(404, "代理商不存在")
+    count = (await db.execute(select(func.count()).select_from(CustomerGroupOwnership)
+        .where(CustomerGroupOwnership.customer_id == customer_id))).scalar_one()
+    if data.max_groups < count: raise HTTPException(400, f"最大群数量不能低于当前绑定群数量{count}")
+    before = {"name": customer.name, "agent_id": customer.agent_id, "plan_code": customer.plan_code, "max_groups": customer.max_groups}
+    customer.name, customer.agent_id, customer.plan_code, customer.max_groups = data.name, data.agent_id, data.plan_code, data.max_groups
+    after = {"name": customer.name, "agent_id": customer.agent_id, "plan_code": customer.plan_code, "max_groups": customer.max_groups}
+    db.add(_log("customer_update", operator_name, "customer", customer.id, before, after, data.reason, data.request_id))
+    await db.commit(); return await _customer_detail(db, customer_id)
+
+
+@router.post("/customers/{customer_id}/renew")
+async def renew_customer(customer_id: int, data: CustomerRenewRequest, db: AsyncSession = Depends(get_db), operator_name: str = Depends(require_admin)):
+    old = await _operation_once(db, "customer_renew", "customer", customer_id, data.request_id)
+    if old: return await _customer_detail(db, customer_id)
+    customer = (await db.execute(select(Customer).where(Customer.id == customer_id).with_for_update())).scalar_one_or_none()
+    if customer is None: raise HTTPException(404, "客户不存在")
+    now = datetime.now(timezone.utc); before = customer.license_expire_at
+    base = before if before and before > now else now
+    customer.license_expire_at = base + timedelta(days=data.duration_days)
+    if customer.license_started_at is None: customer.license_started_at = now
+    customer.license_status = "active"; customer.enabled = True
+    db.add(_log("customer_renew", operator_name, "customer", customer.id, before, customer.license_expire_at, data.reason, data.request_id))
+    await db.commit(); return await _customer_detail(db, customer_id)
+
+
+async def _set_customer_active(customer_id, enabled, data, db, operator_name):
+    op = "customer_resume" if enabled else "customer_pause"
+    old = await _operation_once(db, op, "customer", customer_id, data.request_id)
+    if old: return await _customer_detail(db, customer_id)
+    customer = (await db.execute(select(Customer).where(Customer.id == customer_id).with_for_update())).scalar_one_or_none()
+    if customer is None: raise HTTPException(404, "客户不存在")
+    before = {"enabled": customer.enabled, "license_status": customer.license_status}
+    customer.enabled, customer.license_status = enabled, "active" if enabled else "paused"
+    after = {"enabled": customer.enabled, "license_status": customer.license_status}
+    db.add(_log(op, operator_name, "customer", customer.id, before, after, data.reason, data.request_id))
+    await db.commit(); return await _customer_detail(db, customer_id)
+
+
+@router.post("/customers/{customer_id}/pause")
+async def pause_customer(customer_id: int, data: OperationRequest, db: AsyncSession = Depends(get_db), operator_name: str = Depends(require_admin)):
+    return await _set_customer_active(customer_id, False, data, db, operator_name)
+
+
+@router.post("/customers/{customer_id}/resume")
+async def resume_customer(customer_id: int, data: OperationRequest, db: AsyncSession = Depends(get_db), operator_name: str = Depends(require_admin)):
+    return await _set_customer_active(customer_id, True, data, db, operator_name)
+
+
+@router.get("/codes")
+async def list_codes(page: int = 1, page_size: int = 20, agent_id: int | None = None,
+                     customer_id: int | None = None, code_type: str | None = None,
+                     status: str | None = None, prefix: str | None = None,
+                     created_from: datetime | None = None, created_to: datetime | None = None,
+                     expires_from: datetime | None = None, expires_to: datetime | None = None,
+                     db: AsyncSession = Depends(get_db)):
+    offset = _page(page, page_size); filters = []
+    for column, value in ((RedeemCode.agent_id, agent_id), (RedeemCode.customer_id, customer_id),
+                          (RedeemCode.code_type, code_type), (RedeemCode.status, status)):
+        if value is not None: filters.append(column == value)
+    if prefix: filters.append(RedeemCode.code_prefix.ilike(f"%{prefix.strip()}%"))
+    if created_from: filters.append(RedeemCode.created_at >= created_from)
+    if created_to: filters.append(RedeemCode.created_at <= created_to)
+    if expires_from: filters.append(RedeemCode.expires_at >= expires_from)
+    if expires_to: filters.append(RedeemCode.expires_at <= expires_to)
+    total = (await db.execute(select(func.count()).select_from(RedeemCode).where(*filters))).scalar_one()
+    rows = (await db.execute(select(RedeemCode).where(*filters).order_by(RedeemCode.id.desc())
+        .offset(offset).limit(page_size))).scalars().all()
+    items = []
+    for x in rows:
+        summary = reservation_summary(x)
+        items.append({**RedeemCodeListItem.model_validate(x).model_dump(), **summary,
+            "refundable": summary["remaining_reserved"] if x.reservation_source == "agent_quota" else None})
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
 @router.post("/codes", response_model=RedeemCodeGenerated)
@@ -307,6 +497,10 @@ async def code_reservation(code_id: int, db: AsyncSession = Depends(get_db)):
 
 
 async def _change_code_status(code_id, status, data, db, operator_name):
+    op = f"code_{status}"
+    if data.request_id:
+        old = await _operation_once(db, op, "redeem_code", code_id, data.request_id)
+        if old: return {"success": True, "code_id": code_id, "status": status, "idempotent": True}
     item = (await db.execute(select(RedeemCode).where(RedeemCode.id == code_id)
                             .with_for_update())).scalar_one_or_none()
     if item is None:
@@ -315,11 +509,16 @@ async def _change_code_status(code_id, status, data, db, operator_name):
         return {"success": True, "code_id": item.id, "status": item.status}
     if item.status not in {"active", "frozen"}:
         raise HTTPException(409, "当前授权码状态不允许该操作")
+    if status == "active":
+        released = (await db.execute(select(AgentDiamondQuotaTransaction.id).where(
+            AgentDiamondQuotaTransaction.redeem_code_id == item.id,
+            AgentDiamondQuotaTransaction.transaction_type == "code_release",
+        ))).scalar_one_or_none()
+        if released is not None:
+            raise HTTPException(409, "该授权码已返还未用额度，不能解冻")
     before = item.status
     item.status = status
-    db.add(CommercialOperationLog(operation_type=f"code_{status}", operator_name=operator_name,
-        target_type="redeem_code", target_id=item.id,
-        details_json=json.dumps({"before": before, "after": status, "reason": data.reason})))
+    db.add(_log(op, operator_name, "redeem_code", item.id, before, status, data.reason, data.request_id))
     await db.commit()
     return {"success": True, "code_id": item.id, "status": item.status}
 
@@ -328,6 +527,12 @@ async def _change_code_status(code_id, status, data, db, operator_name):
 async def freeze_code(code_id: int, data: CodeStatusRequest, db: AsyncSession = Depends(get_db),
                       operator_name: str = Depends(require_admin)):
     return await _change_code_status(code_id, "frozen", data, db, operator_name)
+
+
+@router.post("/codes/{code_id}/unfreeze")
+async def unfreeze_code(code_id: int, data: CodeStatusRequest, db: AsyncSession = Depends(get_db),
+                        operator_name: str = Depends(require_admin)):
+    return await _change_code_status(code_id, "active", data, db, operator_name)
 
 
 @router.post("/codes/{code_id}/void")
@@ -340,6 +545,11 @@ async def void_code(code_id: int, data: CodeStatusRequest, db: AsyncSession = De
 async def refund_code_reservation(code_id: int, data: CodeRefundRequest,
                                   db: AsyncSession = Depends(get_db),
                                   operator_name: str = Depends(require_admin)):
+    old_log = await _operation_once(db, "code_refund", "redeem_code", code_id, data.idempotency_key)
+    if old_log:
+        details = json.loads(old_log.details_json)
+        return {"success": True, "code_id": code_id, "released": details["after"]["released"],
+                "quota_before": details["before"]["quota"], "quota_after": details["after"]["quota"]}
     snapshot = (await db.execute(select(RedeemCode.id, RedeemCode.agent_id)
                                  .where(RedeemCode.id == code_id))).first()
     if snapshot is None:
@@ -350,25 +560,37 @@ async def refund_code_reservation(code_id: int, data: CodeRefundRequest,
     item = (await db.execute(select(RedeemCode).where(RedeemCode.id == code_id)
                             .with_for_update().execution_options(populate_existing=True))).scalar_one()
     tx = await release_unused_diamond_quota(db, item, operator_name, data.reason, data.idempotency_key)
-    db.add(CommercialOperationLog(operation_type="code_refund", operator_name=operator_name,
-        target_type="redeem_code", target_id=item.id,
-        details_json=json.dumps({"amount": int(tx.amount), "quota_before": int(tx.quota_before),
-            "quota_after": int(tx.quota_after), "idempotency_key": data.idempotency_key})))
+    db.add(_log("code_refund", operator_name, "redeem_code", item.id,
+        {"quota": int(tx.quota_before)}, {"quota": int(tx.quota_after), "released": int(tx.amount)},
+        data.reason, data.idempotency_key))
     await db.commit()
     return {"success": True, "code_id": item.id, "released": int(tx.amount),
             "quota_before": int(tx.quota_before), "quota_after": int(tx.quota_after)}
 
 
 @router.get("/code-usages")
-async def list_code_usages(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(RedeemCodeUsage).order_by(RedeemCodeUsage.id.desc()).limit(1000))
-    rows = result.scalars().all()
-    return [{
+async def list_code_usages(page: int = 1, page_size: int = 20, agent_id: int | None = None,
+        customer_id: int | None = None, wx_user_id: str | None = None, wx_group_id: str | None = None,
+        usage_type: str | None = None, success: bool | None = None, started_at: datetime | None = None,
+        ended_at: datetime | None = None, db: AsyncSession = Depends(get_db)):
+    offset = _page(page, page_size); filters = []
+    for column, value in ((RedeemCodeUsage.agent_id, agent_id), (RedeemCodeUsage.customer_id, customer_id),
+        (RedeemCodeUsage.usage_type, usage_type), (RedeemCodeUsage.success, success)):
+        if value is not None: filters.append(column == value)
+    if wx_user_id: filters.append(RedeemCodeUsage.wx_user_id.ilike(f"%{wx_user_id.strip()}%"))
+    if wx_group_id: filters.append(RedeemCodeUsage.wx_group_id.ilike(f"%{wx_group_id.strip()}%"))
+    if started_at: filters.append(RedeemCodeUsage.used_at >= started_at)
+    if ended_at: filters.append(RedeemCodeUsage.used_at <= ended_at)
+    total = (await db.execute(select(func.count()).select_from(RedeemCodeUsage).where(*filters))).scalar_one()
+    rows = (await db.execute(select(RedeemCodeUsage).where(*filters).order_by(RedeemCodeUsage.id.desc())
+        .offset(offset).limit(page_size))).scalars().all()
+    items = [{
         "id": r.id, "code_id": r.code_id, "agent_id": r.agent_id, "customer_id": r.customer_id,
         "user_id": r.user_id, "wx_user_id": r.wx_user_id, "group_id": r.group_id,
         "wx_group_id": r.wx_group_id, "usage_type": r.usage_type, "value": r.value,
         "success": r.success, "failure_reason": r.failure_reason, "used_at": r.used_at,
     } for r in rows]
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
 @router.get("/diamonds/{user_id}", response_model=DiamondBalanceResponse)
@@ -380,16 +602,65 @@ async def get_diamond_balance(user_id: int, db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/diamond-transactions")
-async def list_diamond_transactions(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(DiamondTransaction).order_by(DiamondTransaction.id.desc()).limit(1000))
-    rows = result.scalars().all()
-    return [{
+async def list_diamond_transactions(page: int = 1, page_size: int = 20, user_id: int | None = None,
+        wx_user_id: str | None = None, diamond_type: str | None = None, transaction_type: str | None = None,
+        started_at: datetime | None = None, ended_at: datetime | None = None, db: AsyncSession = Depends(get_db)):
+    offset = _page(page, page_size); filters = []
+    for column, value in ((DiamondTransaction.user_id, user_id), (DiamondTransaction.diamond_type, diamond_type),
+                          (DiamondTransaction.transaction_type, transaction_type)):
+        if value is not None: filters.append(column == value)
+    if started_at: filters.append(DiamondTransaction.created_at >= started_at)
+    if ended_at: filters.append(DiamondTransaction.created_at <= ended_at)
+    query = select(DiamondTransaction, User.wx_user_id).join(User, User.id == DiamondTransaction.user_id)
+    count_query = select(func.count()).select_from(DiamondTransaction).join(User, User.id == DiamondTransaction.user_id)
+    if wx_user_id:
+        filters.append(User.wx_user_id.ilike(f"%{wx_user_id.strip()}%"))
+    total = (await db.execute(count_query.where(*filters))).scalar_one()
+    rows = (await db.execute(query.where(*filters).order_by(DiamondTransaction.id.desc())
+        .offset(offset).limit(page_size))).all()
+    items = [{
         "id": x.id, "user_id": x.user_id, "transaction_type": x.transaction_type,
+        "wx_user_id": wx,
         "diamond_type": x.diamond_type, "amount": x.amount,
         "paid_before": x.paid_before, "paid_after": x.paid_after,
         "bonus_before": x.bonus_before, "bonus_after": x.bonus_after,
         "description": x.description, "created_at": x.created_at,
-    } for x in rows]
+    } for x, wx in rows]
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
+
+
+async def _agent_ledger(model, page, page_size, agent_id, operation, actor, request_id, started_at, ended_at, db):
+    offset = _page(page, page_size); filters = []
+    for column, value in ((model.agent_id, agent_id), (model.transaction_type, operation),
+                          (model.operator_name, actor), (model.idempotency_key, request_id)):
+        if value is not None: filters.append(column == value)
+    if started_at: filters.append(model.created_at >= started_at)
+    if ended_at: filters.append(model.created_at <= ended_at)
+    total = (await db.execute(select(func.count()).select_from(model).where(*filters))).scalar_one()
+    rows = (await db.execute(select(model).where(*filters).order_by(model.id.desc()).offset(offset).limit(page_size))).scalars().all()
+    items = []
+    for x in rows:
+        quota = model is AgentDiamondQuotaTransaction
+        items.append({"id": x.id, "agent_id": x.agent_id, "operation": x.transaction_type,
+            "change": int(x.amount), "before": int(x.quota_before if quota else x.balance_before),
+            "after": int(x.quota_after if quota else x.balance_after), "actor": x.operator_name,
+            "request_id": x.idempotency_key, "reason": x.reason if quota else x.description,
+            "created_at": x.created_at})
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
+
+
+@router.get("/agent-license-transactions")
+async def list_agent_license_transactions(page: int = 1, page_size: int = 20, agent_id: int | None = None,
+        operation: str | None = None, actor: str | None = None, request_id: str | None = None,
+        started_at: datetime | None = None, ended_at: datetime | None = None, db: AsyncSession = Depends(get_db)):
+    return await _agent_ledger(AgentLicenseTransaction, page, page_size, agent_id, operation, actor, request_id, started_at, ended_at, db)
+
+
+@router.get("/agent-diamond-quota-transactions")
+async def list_agent_quota_transactions(page: int = 1, page_size: int = 20, agent_id: int | None = None,
+        operation: str | None = None, actor: str | None = None, request_id: str | None = None,
+        started_at: datetime | None = None, ended_at: datetime | None = None, db: AsyncSession = Depends(get_db)):
+    return await _agent_ledger(AgentDiamondQuotaTransaction, page, page_size, agent_id, operation, actor, request_id, started_at, ended_at, db)
 
 
 @router.post("/asset-grants")
@@ -474,6 +745,27 @@ async def create_membership_product(data: MembershipProductCreate, db: AsyncSess
         raise HTTPException(status_code=400, detail="赠钻模式只支持 immediate 或 monthly")
     item = MembershipProduct(**data.model_dump())
     db.add(item); await db.commit(); await db.refresh(item); return item
+
+
+@router.put("/membership/products/{product_id}", response_model=MembershipProductResponse)
+async def update_membership_product(product_id: int, data: MembershipProductUpdate,
+        db: AsyncSession = Depends(get_db), operator_name: str = Depends(require_admin)):
+    old = await _operation_once(db, "membership_product_update", "membership_product", product_id, data.request_id)
+    if old:
+        item = await db.get(MembershipProduct, product_id)
+        if item is None: raise HTTPException(404, "会员商品不存在")
+        return item
+    item = (await db.execute(select(MembershipProduct).where(MembershipProduct.id == product_id).with_for_update())).scalar_one_or_none()
+    if item is None: raise HTTPException(404, "会员商品不存在")
+    if await db.get(MembershipPlan, data.plan_id) is None: raise HTTPException(404, "会员方案不存在")
+    if data.bonus_grant_mode not in {"immediate", "monthly"}: raise HTTPException(400, "赠钻模式无效")
+    before = {k: getattr(item, k) for k in MembershipProductCreate.model_fields}
+    values = data.model_dump(exclude={"reason", "request_id"})
+    for key, value in values.items(): setattr(item, key, value)
+    after = {k: getattr(item, k) for k in MembershipProductCreate.model_fields}
+    db.add(_log("membership_product_update", operator_name, "membership_product", item.id,
+        before, after, data.reason, data.request_id))
+    await db.commit(); await db.refresh(item); return item
 
 
 @router.post("/membership/purchase-diamonds")
