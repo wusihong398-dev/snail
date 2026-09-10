@@ -1,9 +1,10 @@
-name: Package Stage B Preview
+name: Package Commercial Operations Preview
 
 on:
   push:
-    tags:
-      - "v0.3.1-stage-b-preview-*"
+
+  tags:
+  - "v0.3.2-commercial-operations-preview-*"
 
 permissions:
   contents: write
@@ -40,9 +41,9 @@ jobs:
           Project: 蜗牛群聊精灵
           Version: ${VERSION}
           Commit: ${GITHUB_SHA}
-          Branch source: commercial-asset-safety-v0.3.1
-          Package type: Stage B Preview
-          Production deployment: NO
+          Branch source: commercial-operations-v0.3.2
+          Package type: Stage C Commercial Operations Preview
+          Production migration 021/022 executed: NO
           Production migration 021 executed: NO
           EOF
 
@@ -83,4 +84,4 @@ jobs:
             "dist/snail-chat-elf-${GITHUB_REF_NAME}.tar.gz" \
             "dist/SHA256SUMS.txt" \
             --title "蜗牛群聊精灵 ${GITHUB_REF_NAME}" \
-            --notes "Stage B 当前完成代码预览包。此版本尚未部署生产，021 尚未执行生产迁移。"
+            --notes "Stage C 商业运营后台预览包。此版本尚未部署生产，021/022 尚未执行生产迁移。"
